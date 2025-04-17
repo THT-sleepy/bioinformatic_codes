@@ -1,0 +1,100 @@
+#!/bin/bash 
+#===============================================================================
+#
+#          FILE: rnaseq_workflow.sh
+# 
+#         USAGE: rnaseq_workflow.sh
+# 
+#   DESCRIPTION: start from fastq;qc => alignment => qc
+# 
+#       OPTIONS: ---
+#  REQUIREMENTS: 1) conda environment "rnaseq" with fastqc;multiqc;trim-galore;hisat2;samtools;pigz 2) genome index of hisat2 3)bam_add_chr.sh
+#          BUGS: ---
+#         NOTES: path of genome index of hisat2 need ajustment;threads need ajustment(根据实际的电脑进程数)
+#        AUTHOR: Tokato
+#  ORGANIZATION: 
+#       CREATED: 20/2/25
+#      REVISION:  ---
+#      Reference:
+#===============================================================================
+set -o nounset                              # Treat unset variables as an error
+
+
+
+### step1 reads qc step1 CPU核越多越快，本质都是并行计算，内存一个2G不会超
+conda activate rnaseq
+threads=CPU*0.8
+mkdir raw #in fastq.gz dir
+mv *.gz raw
+#watch fastqc的t实质上是进程数而非线程数   (threads得试一下才知道反正) #1个15-25min
+ls raw/*.gz | xargs -I {} -P 400 fastqc  {} 1>raw/log.fastqc 2>&1 
+nohup fastqc -t $threads raw/*.gz 1>raw/log.fastqc 2>&1 &#很快，1000WGS样本估计就几小时10-12h)，不用太担心时间问题
+multiqc --outdir raw/ raw/
+#trim:rm low-quality and adapter
+
+mkdir clean
+ls raw/*1.fq.gz > 1
+ls raw/*2.fq.gz > 2
+paste 1 2 > config
+
+#最佳核心数就是4，占用4-8个CPU，内存大概之前1CPU1G有很大剩余 1000个样本估计也要10多h 7进程程1小时就跑了11对 实在太慢申请200个CPU核心去跑(400线程的话，总线程*0.8除以4)
+nohup sh -c "cat config | xargs -I {} -P 15  bash -c '
+  dir='clean'
+  fq1=$(echo {} | cut -d" " -f1)
+  fq2=$(echo {} | cut -d" " -f2)
+  sample=$(basename $fq1 "_R1.fq.gz")
+  (time trim_galore -q 25 --phred33 --length 50 --cores 4 -e 0.1 --stringency 3 --paired -o $dir $fq1 $fq2) 1>clean/${sample}_log.trim 2>&1 
+' " & 
+
+#watch again
+ls clean/*.gz | xargs -I {} -P 400 fastqc {} 1>clean/log.fastqc 2>&1 
+#nohup fastqc -t $threads clean/*.gz 1>clean/log.fastqc 2>&1 &
+multiqc --outdir clean/ clean/
+conda deactivate
+
+rm raw/*.fq.gz
+
+###step2 alignment 
+conda activate rnaseq
+ls clean/*_1.fq.gz > 1
+ls clean/*_2.fq.gz > 2
+paste 1 2 > config
+
+#fastq2bam threads有多少CPU就assign多少；占用内存最大的步骤是samtools sort 5线程内存大概一个4-5G，hisat2 30线程也是差不多4-5G；sample=那里要自己确认下，不然出来名字会很长
+nohup sh -c "cat config | xargs -I {} -P 1 bash -c '
+  hisat_index=/hitat_index/grch38/genome
+  threads=30
+  fq1=$(echo {} | cut -d" " -f1)
+  fq2=$(echo {} | cut -d" " -f2)
+  sample=$(basename $fq1 "_R1_val_1.fq.gz")
+  bam_add_chr=./bam_add_chr.sh
+  (time hisat2 --threads $threads -x $hisat_index -1 $fq1 -2 $fq2 -S clean/${sample}.hisat.sam ) 1>clean/${sample}_log.hisat2 2>&1
+  (samtools sort -O bam -@ 5 -o clean/${sample}.hisat.bam clean/${sample}.hisat.sam ) 1>clean/${sample}_log.samsort 2>&1
+  $bam_add_chr clean/${sample}.hisat.bam clean/${sample}.chr.bam
+  (samtools index -@ $threads clean/${sample}.chr.bam ) 1>clean/${sample}_log.samindex 2>&1
+  rm clean/${sample}.hisat.sam clean/${sample}.hisat.bam
+'" &
+conda deactivate
+
+
+###step3 bam qc
+mkdir stat
+conda activate rnaseq
+export threads=160
+#先检查下bam文件有无损坏的以及数量有无问题,看下大小有无特别小的
+ls -lh clean/*.bam | awk '{print $5}'  | sort | uniq | less #检查大小
+ls clean/*.bam | wc -l #检查数量
+for i in clean/*.bam ;do (samtools quickcheck $i && echo "ok" || echo $i error);done #检查文件完整性
+
+ls clean/*.bam | xargs -I {} bash -c 'samtools flagstat -@ $threads {} > stat/$(basename {} ".chr.bam").flagstat'
+
+#flagstat merge
+cat stat/* | awk '{print $1}' | paste - - - - - - - - - - - - - - - - > 1.txt
+ls stat/* | while read id; do echo $(basename $id ".hisat.flagstat") >> title ;done
+paste title 1.txt > 2.txt #add header
+awk  '{for (i=1; i<=NF; i++) a[i, NR] = $i} END {for (i=1; i<=NF; i++) {for (j=1; j<=NR; j++) printf "%s ", a[i,j]; print ""}}' 2.txt > 3.txt #transpose
+cat stat/* | awk -F "+" 'NR<17{print $2}' | awk -F "0" 'BEGIN {print ""}{print $2}' > col
+paste col 3.txt > stat/merge.flagstat
+rm 1.txt 2.txt 3.txt col title
+#check order 
+#over

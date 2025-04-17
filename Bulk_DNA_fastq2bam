@@ -1,0 +1,147 @@
+#!/bin/bash 
+#===============================================================================
+#
+#          FILE: dnaseq_workflow.sh
+# 
+#         USAGE: dnaseq_workflow.sh
+# 
+#   DESCRIPTION: start from fastq;qc => alignment => qc
+# 
+#       OPTIONS: ---
+#  REQUIREMENTS: 1) conda environment "dnaseq_upstream" with fastqc;multiqc;trim-galore;bwa;samtools;sra-tools;bcftools;vcftools 2)gatk4(python+openjdk17) 3)bwa index files
+#          BUGS: ---
+#         NOTES: step4中markdup实际上在step3中已经完成；看情况看需不需要其它步骤(call SSM应该是需要的，但Fixmateinformation不能多线程时间需要考虑)
+#        AUTHOR: Tokato
+#  ORGANIZATION: 
+#       CREATED: 15/3/25
+#      REVISION:  ---
+#      Reference:biotrainee
+#===============================================================================
+
+#mkdirs
+mkdir {raw,clean,qc,align,stat1,stat2}
+
+##step1 reads qc
+conda activate dnaseq_upstream
+threads=CPU*0.85
+#下载一个time命令，
+#40Gfq一个需要1h50min
+#内存方面：在登录节点上32CPU20G是够的,传递给fastqc要xargs
+(nohup time fastqc -t $threads raw/*.gz) 1>raw/log.fastqc 2>&1 &
+multiqc --outdir raw/ raw/
+ 
+#trim:rm low-quality and adapter(if needed)
+ls raw/*1.fq.gz > 1
+ls raw/*2.fq.gz > 2
+paste 1 2 > config
+
+nohup sh -c "cat config | xargs -I {} -P 16 bash -c '
+  dir='clean'
+  fq1=$(echo {} | cut -d" " -f1)
+  fq2=$(echo {} | cut -d" " -f2)
+  sample=$(basename $fq1 "_R1.fq.gz")
+  (time trim_galore -q 25 --phred33 --cores 4 --length 50 -e 0.1 --stringency 3 --paired -o $dir $fq1 $fq2) 1> clean/${sample}_log.trim 2>&1
+' " &
+
+#watch again
+(nohup time fastqc -t $threads clean/*.gz) 1>clean/log.fastqc 2>&1 &
+multiqc --outdir clean/ clean/
+conda deactivate
+
+##step2 align-sort-markdup
+conda activate dnaseq_upstream
+ls clean/*_1.fq.gz > 1
+ls clean/*_2.fq.gz > 2
+paste 1 2 > config
+
+nohup sh -c "cat config | xargs -I {} -P 7 bash -c ' 
+  bwa_index=/path/to/bwa_index
+  bwa=/path/to/bwa-mem2
+  GATK=/path/to/gatk
+  threads=4
+  fq1=$(echo {} | cut -d" " -f1)
+  fq2=$(echo {} | cut -d" " -f2)
+  sample=$(basename $fq1 "_R1_val_1.fq.gz")
+  ##align
+  $bwa mem -t $threads -R "@RG\tID:$sample\tSM:$sample\tLB:WGS\tPL:Illumina" $bwa_index $fq1 $fq2 > clean/${sample}.bwa.sam 2>clean/${sample}_bwa.error
+  ##sort
+  samtools sort -@ 4 -O bam -o clean/${sample}.bwa.co_sorted.bam clean/${sample}.bwa.sam 1>clean/${sample}_sort.log 2>&1
+  ##markdup(sambamba is faster)
+  $GATK --java-options "-Xmx50G -Djava.io.tmpdir=./" MarkDuplicatesSpark \
+    -I clean/${sample}.bwa.co_sorted.bam \
+    -O clean/${sample}.bwa.co_sorted.marked.bam \
+	-M clean/${sample}.metrics \
+	--spark-master local[30] \
+    1> clean/${sample}_log.mark 2>&1
+  rm clean/${sample}.bwa.co_sorted.bam clean/${sample}.bwa.sam
+' " 1 > clean/log.bwa 2>&1 &
+
+##step3 bam quality check
+ls clean/*.bam | xargs -P 80 -I {} bash -c 'samtools flagstat -@ 4 {} > stat/$(basename {} ".bam").flagstat'
+
+#flagstat merge
+cat stat1/* | awk '{print $1}' | paste - - - - - - - - - - - - - - - - > 1.txt
+ls stat1/* | while read id; do echo $(basename $id ".bwa.flagstat") >> title ;done
+paste title 1.txt > 2.txt #add header
+awk '{for (i=1; i<=NF; i++) a[i, NR] = $i} END {for (i=1; i<=NF; i++) {for (j=1; j<=NR; j++) printf "%s ", a[i,j]; print ""}}' 2.txt > 3.txt #transpose
+cat stat1/* | awk -F "+" 'NR<17{print $2}' | awk -F "0" 'BEGIN {print ""}{print $2}' > col
+paste col 3.txt > stat1/merge.flagstat
+#check order 
+#over
+
+rm clean/*.sam
+
+##step4 mark PCR duplicate reads & BaseRecalibrate(根据磁盘空间大小确定要不要做BQSR，这一步生成的bam是之前的快两倍，检测突变有必要，结构变异意义不大)
+#这一步要确定下时间，如果过慢，一个超过10min，试着用Picard markduplicate多进程？freebayes是要markduplicates的，看下manta是否需要矫正？
+#gatk spark需要java17
+conda activate dnaseq_upstream
+
+nohup sh -c "ls clean/*.bam | xargs -I {} -P  bash -c '
+  GATK=/biosoft/gatk/gatk-4.6.1.0/gatk
+  sample=/clean/$(basename {} ".bam")
+  ref=/ref_sequences/Homo_sapiens_assembly38.fasta
+  snp=/ref_sequences/dbsnp_146.hg38.vcf.gz
+  indel=/ref_sequences/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
+$GATK --java-options "-Xmx60G -Djava.io.tmpdir=./" MarkDuplicatesSpark \
+    -I $sample.bam \
+    -O ${sample}_marked.bam \
+	-M $sample.metrics \
+	--spark-master local[10] \
+    1>${sample}_log.mark 2>&1 
+$GATK --java-options "-Xmx60G -Djava.io.tmpdir=./" FixMateInformation \
+    -I ${sample}_marked.bam \
+    -O ${sample}_marked_fixed.bam \
+    -SO coordinate \
+    1>${sample}_log.fix 2>&1 
+rm ${sample}_marked.bam
+samtools index -@ 4 ${sample}_marked_fixed.bam
+$GATK --java-options "-Xmx60G -Djava.io.tmpdir=./"  BaseRecalibrator \
+    -R $ref  \
+    -I ${sample}_marked_fixed.bam  \
+    --known-sites $snp \
+    --known-sites $indel \
+    -O ${sample}_recal.table \
+    1>${sample}_log.recal 2>&1 
+$GATK --java-options "-Xmx60G -Djava.io.tmpdir=./"   ApplyBQSR \
+    -R $ref  \
+    -I ${sample}_marked_fixed.bam  \
+    -bqsr ${sample}_recal.table \
+    -O ${sample}_bqsr.bam \
+    1>${sample}_log.ApplyBQSR  2>&1 
+rm ${sample}_marked_fixed.bam
+' " > output.txt 2>&1 &
+
+##step5 bam quality check again
+ls clean/*_bqsr.bam | xargs -P 80 -I {} bash -c 'samtools flagstat -@ 4 {} > stat/$(basename {} ".bam").flagstat'
+
+#flagstat merge
+cat stat2/* | awk '{print $1}' | paste - - - - - - - - - - - - - - - - > 1.txt
+ls stat2/* | while read id; do echo $(basename $id ".bwa.flagstat") >> title ;done
+paste title 1.txt > 2.txt #add header
+awk '{for (i=1; i<=NF; i++) a[i, NR] = $i} END {for (i=1; i<=NF; i++) {for (j=1; j<=NR; j++) printf "%s ", a[i,j]; print ""}}' 2.txt > 3.txt #transpose
+cat stat2/* | awk -F "+" 'NR<17{print $2}' | awk -F "0" 'BEGIN {print ""}{print $2}' > col
+paste col 3.txt > stat2/merge.flagstat2
+
+#check order 
+#over
+rm clean/*.bwa.bam
